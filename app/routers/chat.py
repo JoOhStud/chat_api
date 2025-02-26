@@ -126,6 +126,7 @@ async def chat_endpoint(websocket: WebSocket, chat_id: int, db: AsyncSession = D
                 "id": message.id,
                 "sender": message.sender,
                 "content": data,
+                "timestamp": message.timestamp.isoformat()
             }
             await redis.publish(f"chat_channel:{chat_id}", json.dumps(payload))
     except WebSocketDisconnect:

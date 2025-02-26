@@ -4,14 +4,27 @@ from app.database import engine
 from app.models import Base
 from app.routers import chat, users, auth
 from elasticsearch import AsyncElasticsearch
+import asyncio
 
 es = AsyncElasticsearch(hosts=["http://elasticsearch:9200"])
+
+async def wait_for_elasticsearch(es_client, timeout: int = 60):
+    for i in range(timeout):
+        try:
+            if await es_client.ping():
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    return False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: tworzymy tabele w bazie danych
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    if not await wait_for_elasticsearch(es):
+            raise Exception("Elasticsearch is not available after waiting")
 
     index_name = "users"
     # Sprawdzamy, czy indeks już istnieje
