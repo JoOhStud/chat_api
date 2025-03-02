@@ -4,12 +4,12 @@ import aioredis
 import os
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.orm import selectinload, joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.routers.auth import get_current_user, verify_token
-from app.models import User, Chat
+from app.models import User, Chat, user_chat_association
 from app.models import Message
 from app.search import index_message, search_messages
 from typing import Dict, List, Set
@@ -183,7 +183,7 @@ async def search_chat_messages(chat_id: str, query: str):
 
 
 @router.get("/chats/{chat_id}/messages", response_model=List[dict])
-async def get_chat_history(chat_id: str, limit: int = 50, db: AsyncSession = Depends(get_db)):
+async def get_chat_history(chat_id: int, limit: int = 50, db: AsyncSession = Depends(get_db)):
     """ Pobiera historię wiadomości dla danego czatu """
     result = await db.execute(
         select(Message).where(Message.chat_id == chat_id).order_by(Message.timestamp.desc()).limit(limit)
@@ -191,10 +191,56 @@ async def get_chat_history(chat_id: str, limit: int = 50, db: AsyncSession = Dep
     messages = result.scalars().all()
 
     if not messages:
-        raise HTTPException(status_code=404, detail="No messages found")
+        return []
 
     return [{"id": msg.id, "sender": msg.sender, "content": msg.content, "timestamp": msg.timestamp} for msg in messages]
 
 @router.get("/test")
 async def test_endpoint():
     return { "test":"ok" }
+
+@router.get("/chats/get-or-create/{other_user_id}")
+async def get_or_create_chat(
+    other_user_id: str,
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Zwraca czat 1:1 między aktualnie zalogowanym userem a `other_user_id`.
+    Jeśli taki nie istnieje (i jest zarejestrowany user), tworzy nowy.
+    """
+    current_user_id = user["sub"]
+    user_db = await db.execute(select(User).where(User.id == current_user_id))
+    result_other = await db.execute(select(User).where(User.id == other_user_id))
+    other_user_db = result_other.scalar()
+    if not other_user_db or not user_db.scalar():
+        raise HTTPException(status_code=404, detail="Użytkownik nie istnieje w bazie")
+
+    stmt = (
+        select(Chat)
+        .options(selectinload(Chat.participants))
+        .join(user_chat_association, Chat.id == user_chat_association.c.chat_id)
+        .where(user_chat_association.c.user_id.in_([current_user_id, other_user_id]))
+        .group_by(Chat.id)
+        .having(func.count(distinct(user_chat_association.c.user_id)) == 2)
+    )
+    
+    existing_chat = (await db.execute(stmt)).scalars().first()
+    if existing_chat:
+        return {"chat": {"id": existing_chat.id, "name": existing_chat.name, "participants": [{"id": p.id, "username": p.username} for p in existing_chat.participants]}, "detail": "existing_chat"}
+    
+    # Tworzymy nowy czat
+    new_chat = Chat(name="")
+    result_current = await db.execute(select(User).where(User.id == current_user_id))
+    current_user_db = result_current.scalar()
+    if not current_user_db:
+        raise HTTPException(status_code=401, detail="Aktualny użytkownik nie znaleziony w bazie")
+
+    new_chat.participants.append(current_user_db)
+    new_chat.participants.append(other_user_db)
+
+    db.add(new_chat)
+    await db.commit()
+    await db.refresh(new_chat)
+
+    return {"chat": {"id": new_chat.id, "name": new_chat.name, "participants": [{"id": p.id, "username": p.username} for p in new_chat.participants]}, "detail": "created_new_chat"}
