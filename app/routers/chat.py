@@ -3,6 +3,7 @@ import json
 import aioredis
 import os
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Depends
+import httpx
 from pydantic import BaseModel
 from sqlalchemy import distinct, func, select
 from sqlalchemy.orm import selectinload, joinedload
@@ -135,6 +136,46 @@ async def chat_endpoint(websocket: WebSocket, chat_id: int, db: AsyncSession = D
 class ChatCreate(BaseModel):
     userId: str
     
+@router.get("/chats/")
+async def list_chats(user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(User)
+        .options(
+            joinedload(User.chats).joinedload(Chat.participants)
+        )
+        .where(User.id == user["sub"])
+    )
+    user_db = result.unique().scalar_one_or_none()
+    
+    if not user_db:
+        return []
+    
+    async with httpx.AsyncClient() as client:
+        async def fetch_picture(participant):
+            try:
+                resp = await client.get(f"http://user_service:8000/admin/api/users/users/{participant.id}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("picture")
+                return None
+            except Exception:
+                return None
+
+        chats_response = []
+        for chat in user_db.chats:
+            tasks = [fetch_picture(p) for p in chat.participants]
+            pictures = await asyncio.gather(*tasks)
+            participants_data = [
+                {"id": p.id, "username": p.username, "picture": pictures[idx]}
+                for idx, p in enumerate(chat.participants)
+            ]
+            chats_response.append({
+                "id": chat.id,
+                "name": chat.name,
+                "participants": participants_data,
+            })
+    return chats_response
+
 @router.post("/chats/")
 async def create_chat(chat: ChatCreate, user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """ Tworzenie nowego czatu """
@@ -158,20 +199,20 @@ async def create_chat(chat: ChatCreate, user=Depends(get_current_user), db: Asyn
     await db.commit()
     return {"message": "Chat created", "chat_id": chat.id}
 
-@router.get("/chats/")
-async def list_chats(user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(User)
-        .options(
-            joinedload(User.chats).joinedload(Chat.participants)
-        )
-        .where(User.id == user["sub"])
-    )
-    user_db = result.unique().scalar_one_or_none()
-    if not user_db:
-        # Zamiast zwracać 404, zwracamy pustą listę, co informuje, że użytkownik nie ma jeszcze żadnych czatów
-        return []
-    return [{"id": chat.id, "name": chat.name, "participants": [{"id": p.id, "username": p.username} for p in chat.participants]} for chat in user_db.chats]
+# @router.get("/chats/")
+# async def list_chats(user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+#     result = await db.execute(
+#         select(User)
+#         .options(
+#             joinedload(User.chats).joinedload(Chat.participants)
+#         )
+#         .where(User.id == user["sub"])
+#     )
+#     user_db = result.unique().scalar_one_or_none()
+#     if not user_db:
+#         # Zamiast zwracać 404, zwracamy pustą listę, co informuje, że użytkownik nie ma jeszcze żadnych czatów
+#         return []
+#     return [{"id": chat.id, "name": chat.name, "participants": [{"id": p.id, "username": p.username} for p in chat.participants]} for chat in user_db.chats]
 
 
 @router.get("/chats/{chat_id}/search")
